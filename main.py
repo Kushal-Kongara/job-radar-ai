@@ -60,11 +60,16 @@ def run():
         except Exception as e:
             print(e)
 
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     if results:
         body = "\n\n".join(results)
-        send_email("🚨 Job Alert Matches Found", body)
+        subject = f"🚨 Job Radar: {len(results)} possible matches ({now})"
+        send_email(subject, body)
     else:
-        print("No strong matches now")
+        subject = f"✅ Job Radar: ran OK, 0 matches ({now})"
+        body = "No matches this run.\n\nNext step: switch to real job feeds (Greenhouse/Lever/Workday) so results are real postings, not career-page HTML."
+        send_email(subject, body)
+
 
 if __name__ == "__main__":
     run()
