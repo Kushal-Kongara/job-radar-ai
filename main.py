@@ -27,7 +27,7 @@ def send_email(subject, body):
 
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
         server.starttls()
-        server.login(os.getenv("GMAIL_USER"), os.getenv("GMAIL_PASS"))
+        server.login(os.getenv("GMAIL_USER"), os.getenv("GMAIL_APP_PASSWORD"))
         server.send_message(msg)
 
 def analyze_job(text):
