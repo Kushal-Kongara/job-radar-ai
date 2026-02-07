@@ -15,38 +15,23 @@ GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Target profile ---
-TARGET = {
-    "country": "United States",
-    "years": "3-4",
-    "roles_keywords": [
-        "software engineer", "full stack", "full-stack", "frontend", "front-end",
-        "web", "ui", "product engineer"
-    ],
-    "exclude_keywords": [
-        "staff", "principal", "sr.", "senior manager", "manager", "director", "vp",
-        "embedded", "verification", "hardware", "firmware", "intern", "internship"
-    ],
-}
-
-# --- Sources (Greenhouse + Lever) ---
-GREENHOUSE_BOARDS = [
-    # add more later
-    {"company": "Stripe", "board": "stripe"},
-    {"company": "Notion", "board": "notion"},
-    {"company": "Coinbase", "board": "coinbase"},
-    {"company": "Figma", "board": "figma"},
+TARGET_KEYWORDS = [
+    "software engineer",
+    "full stack",
+    "frontend",
+    "front end",
+    "web engineer",
+    "product engineer"
 ]
 
-LEVER_COMPANIES = [
-    # add more later
-    {"company": "Pinterest", "handle": "pinterest"},
-    {"company": "Rivian", "handle": "rivian"},
+EXCLUDE = [
+    "senior", "staff", "principal", "lead",
+    "manager", "director", "vp", "sr.",
+    "intern", "internship", "embedded",
+    "hardware", "verification"
 ]
 
-HEADERS = {"User-Agent": "job-radar-ai/1.0"}
-
-def send_email(subject: str, body: str):
+def send_email(subject, body):
     msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = GMAIL_USER
@@ -57,147 +42,151 @@ def send_email(subject: str, body: str):
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         server.send_message(msg)
 
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
-
-def keyword_match(title: str) -> bool:
-    t = norm(title)
-    if any(k in t for k in TARGET["exclude_keywords"]):
+def valid_title(title):
+    t = title.lower()
+    if any(x in t for x in EXCLUDE):
         return False
-    return any(k in t for k in TARGET["roles_keywords"])
+    return any(x in t for x in TARGET_KEYWORDS)
 
-def is_us_location(location: str) -> bool:
-    loc = norm(location)
-    if not loc:
+def is_us(loc):
+    l = (loc or "").lower()
+    return (
+        "united states" in l or
+        "usa" in l or
+        "us remote" in l or
+        "remote - us" in l or
+        "remote (us" in l
+    )
+
+def posted_recent(updated_at):
+    if not updated_at:
         return False
-    # simple heuristics
-    return ("united states" in loc) or ("usa" in loc) or (", us" in loc) or ("remote - us" in loc) or ("remote (us" in loc)
+    try:
+        dt = datetime.fromisoformat(updated_at.replace("Z","+00:00"))
+        return datetime.utcnow() - dt < timedelta(hours=24)
+    except:
+        return False
 
-def fetch_greenhouse_jobs(board: str):
+# -------- GREENHOUSE ----------
+def greenhouse(board):
     url = f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs?content=true"
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
+    r = requests.get(url, timeout=30)
     data = r.json()
     jobs = []
     for j in data.get("jobs", []):
         jobs.append({
-            "source": "Greenhouse",
             "company": board,
-            "title": j.get("title", ""),
-            "location": (j.get("location") or {}).get("name", ""),
-            "url": j.get("absolute_url", ""),
-            "updated_at": j.get("updated_at", ""),
-            "description": (j.get("content") or "")[:6000],
+            "title": j.get("title"),
+            "loc": (j.get("location") or {}).get("name"),
+            "url": j.get("absolute_url"),
+            "updated": j.get("updated_at"),
+            "desc": (j.get("content") or "")[:2000]
         })
     return jobs
 
-def fetch_lever_jobs(handle: str):
+# -------- LEVER ----------
+def lever(handle):
     url = f"https://api.lever.co/v0/postings/{handle}?mode=json"
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
+    r = requests.get(url, timeout=30)
     data = r.json()
     jobs = []
     for j in data:
         jobs.append({
-            "source": "Lever",
             "company": handle,
-            "title": j.get("text", ""),
-            "location": (j.get("categories") or {}).get("location", ""),
-            "url": j.get("hostedUrl", ""),
-            "updated_at": j.get("createdAt", ""),
-            "description": (j.get("descriptionPlain") or "")[:6000],
+            "title": j.get("text"),
+            "loc": (j.get("categories") or {}).get("location"),
+            "url": j.get("hostedUrl"),
+            "updated": datetime.utcfromtimestamp(j.get("createdAt")/1000).isoformat(),
+            "desc": (j.get("descriptionPlain") or "")[:2000]
         })
     return jobs
 
-def ai_rank(job):
+GREENHOUSE = ["stripe","notion","coinbase","figma"]
+LEVER = ["pinterest","robinhood","rippling","scaleai"]
+
+def ai_score(job):
     prompt = f"""
-You are screening jobs for a candidate with {TARGET["years"]} years experience targeting Full Stack / Software Engineer / Frontend roles in the United States.
+Candidate: 3-4 years full stack / frontend engineer US.
 
-Return JSON ONLY with:
-- match: integer 0-100
-- reason: 1-2 short sentences
-- must_have_skills: array of up to 6 keywords
+Score 0-100 fit.
 
-Job title: {job["title"]}
-Company: {job["company"]}
-Location: {job["location"]}
-Job description:
-{job["description"][:2500]}
+Job:
+{job['title']}
+{job['desc'][:1500]}
+
+Return ONLY number.
 """
-    res = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-    )
-    text = res.choices[0].message.content.strip()
     try:
-        return json.loads(text)
-    except Exception:
-        # fallback if model returns non-json
-        return {"match": 0, "reason": "AI output parse failed", "must_have_skills": []}
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0
+        )
+        text = r.choices[0].message.content.strip()
+        num = int(re.findall(r"\d+", text)[0])
+        return num
+    except:
+        return 50
 
 def run():
     all_jobs = []
 
-    for x in GREENHOUSE_BOARDS:
+    for g in GREENHOUSE:
         try:
-            jobs = fetch_greenhouse_jobs(x["board"])
-            for j in jobs:
-                j["company"] = x["company"]
-            all_jobs.extend(jobs)
-        except Exception as e:
-            print("Greenhouse error", x, e)
+            all_jobs += greenhouse(g)
+        except:
+            pass
 
-    for x in LEVER_COMPANIES:
+    for l in LEVER:
         try:
-            jobs = fetch_lever_jobs(x["handle"])
-            for j in jobs:
-                j["company"] = x["company"]
-            all_jobs.extend(jobs)
-        except Exception as e:
-            print("Lever error", x, e)
+            all_jobs += lever(l)
+        except:
+            pass
 
-    # basic filters
     filtered = []
     for j in all_jobs:
-        if not keyword_match(j["title"]):
-            continue
-        if not is_us_location(j["location"]):
-            continue
+        if not valid_title(j["title"]): continue
+        if not is_us(j["loc"]): continue
+        if not posted_recent(j["updated"]): continue
         filtered.append(j)
 
-    # rank with AI (limit cost)
     ranked = []
-    for j in filtered[:15]:
-        score = ai_rank(j)
-        ranked.append((score.get("match", 0), score, j))
-        time.sleep(0.2)
+    for j in filtered[:20]:
+        score = ai_score(j)
+        ranked.append((score, j))
+        time.sleep(0.3)
 
-    ranked.sort(key=lambda x: x[0], reverse=True)
-
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    ranked.sort(reverse=True)
 
     if not ranked:
-        subject = f"✅ Job Radar: ran OK, 0 matches ({now})"
-        body = "No matching jobs found from Greenhouse/Lever sources in this run.\n\nNext: add more company boards."
-        send_email(subject, body)
+        send_email(
+            "⚠️ Job Radar: 0 matches last 24h",
+            "No strong matches in last 24 hrs.\nMarket is slow today."
+        )
         return
 
     lines = []
-    for match, score, j in ranked[:10]:
+    for s, j in ranked[:10]:
+        if s < 60: continue
         lines.append(
-            f"Match: {match}/100\n"
-            f"{j['company']} — {j['title']}\n"
-            f"Location: {j['location']}\n"
-            f"Apply: {j['url']}\n"
-            f"Reason: {score.get('reason','')}\n"
-            f"Skills: {', '.join(score.get('must_have_skills', []))}\n"
+            f"{j['company'].upper()} — {j['title']}\n"
+            f"Score: {s}/100\n"
+            f"{j['loc']}\n"
+            f"{j['url']}\n"
             f"{'-'*40}"
         )
 
-    subject = f"🚨 Job Radar: top {min(10,len(ranked))} matches ({now})"
-    body = "\n".join(lines)
-    send_email(subject, body)
+    if not lines:
+        send_email(
+            "⚠️ Job Radar: nothing worth applying",
+            "Jobs exist but none strong match today."
+        )
+        return
+
+    send_email(
+        "🚨 HIGH MATCH JOBS (apply fast)",
+        "\n".join(lines)
+    )
 
 if __name__ == "__main__":
     run()
